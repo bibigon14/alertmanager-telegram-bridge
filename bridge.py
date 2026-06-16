@@ -196,7 +196,7 @@ SEVERITY_EMOJI = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
 STATUS_EMOJI   = {"firing": "🔥", "resolved": "✅"}
 
 
-def format_alert(alert: dict) -> str:
+def format_alert(alert: dict, tz: ZoneInfo = ZoneInfo("UTC")) -> str:
     labels      = alert.get("labels", {})
     annotations = alert.get("annotations", {})
     status      = alert.get("status", "firing")
@@ -223,9 +223,11 @@ def format_alert(alert: dict) -> str:
         lines.append("\n🏷 " + "  ".join(f"<code>{k}={v}</code>" for k, v in extra.items()))
 
     if status == "firing" and alert.get("startsAt"):
-        lines.append(f"\n🕐 Fired: {alert['startsAt'][:19].replace('T', ' ')} UTC")
+        ts = datetime.fromisoformat(alert["startsAt"].replace("Z", "+00:00")).astimezone(tz)
+        lines.append(f"\n🕐 Fired: {ts.strftime('%Y-%m-%d %H:%M %Z')}")
     elif status == "resolved" and alert.get("endsAt"):
-        lines.append(f"\n🕐 Resolved: {alert['endsAt'][:19].replace('T', ' ')} UTC")
+        ts = datetime.fromisoformat(alert["endsAt"].replace("Z", "+00:00")).astimezone(tz)
+        lines.append(f"\n🕐 Resolved: {ts.strftime('%Y-%m-%d %H:%M %Z')}")
 
     return "\n".join(lines)
 
@@ -375,7 +377,7 @@ def poll_loop(handler: BotCommandHandler, token: str):
                 offset = upd["update_id"] + 1
                 handler.handle(upd)
         except Exception as e:
-            log.debug("Polling error: %s", e)
+            log.error("Polling error: %s", e)
             time.sleep(5)
 
 
@@ -449,7 +451,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
             elif status == "resolved":
                 self.throttle.clear_resolved(fp)
 
-            text    = format_alert(alert)
+            qh  = cfg.get("quiet_hours", {})
+            tz  = ZoneInfo(qh.get("timezone", "UTC"))
+            text    = format_alert(alert, tz)
             targets = resolve_routes(cfg, alert)
 
             if not targets:
