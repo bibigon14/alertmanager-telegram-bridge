@@ -1,0 +1,23 @@
+services:
+  alertmanager-telegram-bridge:
+    build: .
+    image: alertmanager-telegram-bridge:latest
+    container_name: alertmanager-telegram-bridge
+    restart: unless-stopped
+    ports:
+      - "9119:9119"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+    environment:
+      - BRIDGE_CONFIG=/config/config.yaml
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9119/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

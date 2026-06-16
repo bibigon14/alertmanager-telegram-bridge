@@ -1,0 +1,40 @@
+# alertmanager.yml — example showing how to wire up alertmanager-telegram-bridge
+#
+# Drop this into /etc/alertmanager/alertmanager.yml (or merge with your existing config).
+# The bridge listens on :9119 by default.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ["alertname", "instance"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 1h        # Alertmanager-level repeat; bridge has its own throttle too
+  receiver: "telegram-bridge"
+
+  routes:
+    # Page immediately for critical, no grouping delay
+    - match:
+        severity: critical
+      group_wait: 0s
+      receiver: "telegram-bridge"
+
+receivers:
+  - name: "telegram-bridge"
+    webhook_configs:
+      - url: "http://localhost:9119/webhook"
+        send_resolved: true
+        # Optional: basic auth if you add it to the bridge later
+        # http_config:
+        #   basic_auth:
+        #     username: "alertmanager"
+        #     password: "secret"
+
+inhibit_rules:
+  # Suppress warning when critical fires for same alertname+instance
+  - source_match:
+      severity: critical
+    target_match:
+      severity: warning
+    equal: ["alertname", "instance"]
