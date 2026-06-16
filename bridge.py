@@ -375,7 +375,7 @@ def poll_loop(handler: BotCommandHandler, token: str):
                 offset = upd["update_id"] + 1
                 handler.handle(upd)
         except Exception as e:
-            log.error("Polling error: %s", e)
+            log.debug("Polling error: %s", e)
             time.sleep(5)
 
 
