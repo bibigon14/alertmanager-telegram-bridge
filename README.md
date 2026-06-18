@@ -2,10 +2,10 @@
 
 Lightweight [Alertmanager](https://prometheus.io/docs/alerting/latest/alertmanager/) webhook receiver that forwards alerts to Telegram.
 
-No external dependencies beyond PyYAML. Zero bloat. Runs on a Raspberry Pi.
+No external dependencies beyond PyYAML. Zero bloat. Runs on a Raspberry Pi (on k3s).
 
 ```
-Alertmanager ──POST /webhook──► bridge.py ──► Telegram Bot API
+Alertmanager (systemd, on host) ──POST /webhook──► bridge.py (k3s pod) ──► Telegram Bot API
 ```
 
 ## Features
@@ -15,8 +15,8 @@ Alertmanager ──POST /webhook──► bridge.py ──► Telegram Bot API
 - **Routing** — send different alerts to different chats based on labels (severity, job, instance…)
 - **Regex routing** — `match_re` for flexible label matching
 - **`resolved` support** — fires a green ✅ message when Alertmanager clears the alert
-- **`/healthz`** endpoint for uptime monitors
-- **systemd** + **Docker** deployment options
+- **`/healthz`** endpoint for uptime monitors and Kubernetes liveness/readiness probes
+- **Runs as a Kubernetes Deployment** on a single-node k3s cluster (see [homelab-k3s](https://github.com/bibigon14/homelab-k3s)), exposed via NodePort so the host's systemd-managed Alertmanager can reach it
 - Zero external HTTP libraries — uses only Python stdlib + PyYAML
 
 ## Alert format
@@ -33,37 +33,52 @@ CPU usage above 90% for more than 5 minutes
 🕐 Fired: 2026-06-01 03:15:22 UTC
 ```
 
-## Quick start
+## Quick start (k3s)
 
-### systemd (recommended for Pi)
+This bridge runs as a Kubernetes Deployment, with config delivered via a Secret. Manifest lives in [homelab-k3s/apps/bridge](https://github.com/bibigon14/homelab-k3s/tree/main/apps/bridge).
 
 ```bash
-# 1. Clone
+# 1. Clone and configure
 git clone https://github.com/bibigon14/alertmanager-telegram-bridge
 cd alertmanager-telegram-bridge
-
-# 2. Install
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
-
-# 3. Configure
 cp config.yaml.example config.yaml
 $EDITOR config.yaml   # fill in token + chat_id
 
-# 4. Install service
+# 2. Create the Secret from the config file
+kubectl create secret generic bridge-config \
+  --from-file=config.yaml=config.yaml -n homelab
+
+# 3. Build and import the image (no registry — single-node cluster)
+docker build -t alertmanager-telegram-bridge:latest .
+docker save alertmanager-telegram-bridge:latest | sudo k3s ctr images import -
+
+# 4. Deploy
+kubectl apply -f /path/to/homelab-k3s/apps/bridge/deployment.yaml
+
+# 5. Check logs
+kubectl logs -n homelab deploy/alertmanager-telegram-bridge -f
+```
+
+The Service is exposed as `NodePort 30119`, so on the host, the bridge is reachable at `http://localhost:30119/webhook` — same port Alertmanager (running via systemd on the host, not in k3s) is configured to send to.
+
+## Alternative: systemd / Docker
+
+For a non-Kubernetes setup, the bridge also runs fine as a plain systemd service or standalone Docker container.
+
+### systemd
+
+```bash
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
 sudo cp systemd/alertmanager-telegram-bridge.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now alertmanager-telegram-bridge
-
-# 5. Check logs
 journalctl -u alertmanager-telegram-bridge -f
 ```
 
 ### Docker
 
 ```bash
-cp config.yaml.example config.yaml
-$EDITOR config.yaml
 docker compose up -d
 ```
 
@@ -111,13 +126,14 @@ Rules are evaluated **top-down**. First match wins unless `continue: true` is se
 
 ## Alertmanager integration
 
-Add to your `alertmanager.yml`:
+On the host's `alertmanager.yml` (Alertmanager itself stays on the host, not in k3s):
 
 ```yaml
 receivers:
   - name: telegram
     webhook_configs:
-      - url: "http://localhost:9119/webhook"
+      - url: "http://localhost:30119/webhook"   # NodePort, if bridge runs in k3s
+        # url: "http://localhost:9119/webhook"  # if running standalone (systemd/Docker)
         send_resolved: true
 
 route:
@@ -141,7 +157,8 @@ python -m pytest tests/ -v
 ## Healthcheck
 
 ```bash
-curl http://localhost:9119/healthz
+curl http://localhost:30119/healthz   # k3s (NodePort)
+curl http://localhost:9119/healthz    # standalone (systemd/Docker)
 # → ok
 ```
 
@@ -150,6 +167,7 @@ curl http://localhost:9119/healthz
 - Raspberry Pi 5 (Raspberry Pi OS Lite 64-bit)
 - Python 3.11
 - Alertmanager 0.27
+- k3s v1.35
 
 ## License
 
