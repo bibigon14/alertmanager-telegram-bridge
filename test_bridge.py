@@ -22,6 +22,7 @@ from bridge import (
     alert_fingerprint,
     resolve_routes,
     BotCommandHandler,
+    WebhookHandler,
 )
 
 
@@ -299,6 +300,76 @@ class TestBotCommandHandler(unittest.TestCase):
         with patch("bridge.send_telegram") as mock_send:
             h.handle(update)
             mock_send.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# WebhookHandler._process — quiet hours vs. resolved alerts
+# ---------------------------------------------------------------------------
+class TestProcessQuietHoursResolved(unittest.TestCase):
+    """Regression coverage for: resolved alerts must always be delivered,
+    even for non-critical severity during quiet hours. Quiet hours should
+    only ever suppress *new* (firing) non-critical alerts."""
+
+    def _handler(self, quiet_hours_enabled=True):
+        cfg = {
+            "telegram": {"token": "TOKEN", "default_chat_id": "DEFAULT"},
+            "quiet_hours": {
+                "enabled": quiet_hours_enabled,
+                "start": "23:00", "end": "07:00", "timezone": "UTC",
+            },
+            "routes": [],
+            "throttle": {"repeat_interval": 300},
+        }
+        h = WebhookHandler.__new__(WebhookHandler)
+        h.cfg      = cfg
+        h.throttle = ThrottleStore(300)
+        h.stats    = Stats()
+        h.mute     = MuteControl()
+        return h
+
+    def _alert(self, status="firing", severity="warning", alertname="KubeJobFailed"):
+        return {
+            "status": status,
+            "labels": {"alertname": alertname, "severity": severity},
+            "annotations": {},
+            "startsAt": "2026-06-20T05:00:00Z",
+            "endsAt": "2026-06-20T06:00:00Z",
+        }
+
+    def test_warning_resolved_sent_during_quiet_hours(self):
+        h = self._handler()
+        with patch("bridge.is_quiet_hours", return_value=True), \
+             patch("bridge.send_telegram", return_value=True) as mock_send:
+            h._process({"alerts": [self._alert(status="resolved", severity="warning")]})
+            mock_send.assert_called_once()
+        self.assertEqual(h.stats.sent, 1)
+        self.assertEqual(h.stats.suppressed, 0)
+
+    def test_warning_firing_still_suppressed_during_quiet_hours(self):
+        h = self._handler()
+        with patch("bridge.is_quiet_hours", return_value=True), \
+             patch("bridge.send_telegram", return_value=True) as mock_send:
+            h._process({"alerts": [self._alert(status="firing", severity="warning")]})
+            mock_send.assert_not_called()
+        self.assertEqual(h.stats.suppressed, 1)
+
+    def test_critical_firing_sent_during_quiet_hours(self):
+        h = self._handler()
+        with patch("bridge.is_quiet_hours", return_value=True), \
+             patch("bridge.send_telegram", return_value=True) as mock_send:
+            h._process({"alerts": [self._alert(status="firing", severity="critical")]})
+            mock_send.assert_called_once()
+        self.assertEqual(h.stats.sent, 1)
+
+    def test_resolved_clears_throttle_store(self):
+        h = self._handler()
+        alert = self._alert(status="resolved", severity="warning")
+        fp = alert_fingerprint(alert)
+        h.throttle._store[fp] = time.time()
+        with patch("bridge.is_quiet_hours", return_value=True), \
+             patch("bridge.send_telegram", return_value=True):
+            h._process({"alerts": [alert]})
+        self.assertNotIn(fp, h.throttle._store)
 
 
 if __name__ == "__main__":

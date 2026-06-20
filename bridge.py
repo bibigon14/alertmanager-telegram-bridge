@@ -13,7 +13,7 @@ import threading
 from datetime import datetime, time as dtime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.request import urlopen, Request
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -143,13 +143,20 @@ def is_quiet_hours(cfg: dict, mute: MuteControl) -> bool:
 # ---------------------------------------------------------------------------
 # Telegram API helpers
 # ---------------------------------------------------------------------------
-def tg_request(token: str, method: str, payload: dict) -> dict | None:
+def tg_request(token: str, method: str, payload: dict, timeout: int = 10) -> dict | None:
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = json.dumps(payload).encode()
     req = Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
-        with urlopen(req, timeout=10) as resp:
+        with urlopen(req, timeout=timeout) as resp:
             return json.load(resp)
+    except HTTPError as e:
+        # Distinguish HTTP-level failures (4xx/5xx with a body) from
+        # connection-level errors. 409 is the common one — Telegram holds a
+        # getUpdates reservation for ~30s after the previous poll dropped,
+        # and bombarding it during that window just renews the conflict.
+        log.error("Telegram API %s HTTP %d: %s", method, e.code, e.reason)
+        return {"ok": False, "error_code": e.code, "description": str(e.reason)}
     except URLError as e:
         log.error("Telegram API %s error: %s", method, e)
         return None
@@ -167,15 +174,19 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
     return True
 
 
-def get_updates(token: str, offset: int, timeout: int = 30) -> list[dict]:
+def get_updates(token: str, offset: int, timeout: int = 30) -> tuple[list[dict], bool]:
+    # HTTP timeout must exceed Telegram's long-poll timeout, otherwise
+    # urlopen will raise socket.timeout on every quiet polling cycle.
+    # Telegram caps long_poll at 50s; we use timeout+5 as a safe buffer.
+    # Returns (updates, ok) — ok=False signals the caller to back off.
     result = tg_request(token, "getUpdates", {
         "offset": offset,
         "timeout": timeout,
         "allowed_updates": ["message"],
-    })
+    }, timeout=timeout + 5)
     if result and result.get("ok"):
-        return result.get("result", [])
-    return []
+        return result.get("result", []), True
+    return [], False
 
 
 def set_bot_commands(token: str):
@@ -370,9 +381,16 @@ class BotCommandHandler:
 def poll_loop(handler: BotCommandHandler, token: str):
     log.info("Bot polling started")
     offset = 0
+    # When getUpdates returns an error (typically 409 Conflict after a
+    # previous poll was dropped), back off well past Telegram's 30-second
+    # reservation window. Without this the loop hot-spins on the error.
+    ERROR_BACKOFF_SECONDS = 40
     while True:
         try:
-            updates = get_updates(token, offset, timeout=30)
+            updates, ok = get_updates(token, offset, timeout=30)
+            if not ok:
+                time.sleep(ERROR_BACKOFF_SECONDS)
+                continue
             for upd in updates:
                 offset = upd["update_id"] + 1
                 handler.handle(upd)
@@ -438,18 +456,21 @@ class WebhookHandler(BaseHTTPRequestHandler):
             fp       = alert_fingerprint(alert)
             is_crit  = severity == "critical"
 
-            if quiet and not is_crit:
+            # Resolved notifications always go through, regardless of quiet
+            # hours or severity. Quiet hours exist to avoid waking people up
+            # over new problems — they shouldn't also hide the fact that a
+            # problem already went away, or you wake up with no idea whether
+            # last night's warning is still live.
+            if status == "resolved":
+                self.throttle.clear_resolved(fp)
+            elif quiet and not is_crit:
                 log.info("Suppressed (quiet hours): %s", fp)
                 self.stats.inc("suppressed")
                 continue
-
-            if status == "firing":
-                if not self.throttle.should_send(fp):
-                    log.info("Throttled: %s", fp)
-                    self.stats.inc("throttled")
-                    continue
-            elif status == "resolved":
-                self.throttle.clear_resolved(fp)
+            elif not self.throttle.should_send(fp):
+                log.info("Throttled: %s", fp)
+                self.stats.inc("throttled")
+                continue
 
             qh  = cfg.get("quiet_hours", {})
             tz  = ZoneInfo(qh.get("timezone", "UTC"))
