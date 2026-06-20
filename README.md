@@ -91,7 +91,7 @@ server:
 
 telegram:
   token: "7123456789:AAF..."
-  default_chat_id: "85698759"
+  default_chat_id: "85....."
 
 throttle:
   repeat_interval: 300   # seconds between repeated firing alerts
