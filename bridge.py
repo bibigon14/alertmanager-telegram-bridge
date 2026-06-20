@@ -17,6 +17,67 @@ from urllib.error import URLError, HTTPError
 from zoneinfo import ZoneInfo
 
 import yaml
+from prometheus_client import (
+    Counter, Histogram, Gauge, Info,
+    CONTENT_TYPE_LATEST, generate_latest,
+)
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+# All metric names are namespaced under `bridge_` and follow the
+# Prometheus naming conventions (https://prometheus.io/docs/practices/naming/):
+# counters end in `_total`, histograms expose `_seconds`, gauges describe
+# instantaneous state.
+M_ALERTS_RECEIVED = Counter(
+    "bridge_alerts_received_total",
+    "Total alerts received from Alertmanager webhooks, by severity and status.",
+    ["severity", "status"],
+)
+M_TELEGRAM_SENT = Counter(
+    "bridge_telegram_sent_total",
+    "Total Telegram messages successfully delivered, by severity and status.",
+    ["severity", "status"],
+)
+M_ALERTS_SUPPRESSED = Counter(
+    "bridge_alerts_suppressed_total",
+    "Alerts suppressed and not delivered, broken down by reason.",
+    ["reason", "severity"],   # reason: quiet_hours | throttle | mute
+)
+M_TELEGRAM_SEND_DURATION = Histogram(
+    "bridge_telegram_send_duration_seconds",
+    "Latency of Telegram sendMessage calls.",
+    buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+M_TELEGRAM_ERRORS = Counter(
+    "bridge_telegram_errors_total",
+    "Telegram API errors, by API method and error type.",
+    ["method", "error_type"],  # method: sendMessage|getUpdates|setMyCommands; error_type: http_4xx|http_5xx|network|timeout
+)
+M_GETUPDATES_BACKOFF_SECONDS = Counter(
+    "bridge_getupdates_backoff_seconds_total",
+    "Cumulative seconds spent backing off after getUpdates errors (typically 409 Conflict).",
+)
+M_QUIET_HOURS_ACTIVE = Gauge(
+    "bridge_quiet_hours_active",
+    "1 if quiet hours are currently active (either by schedule or manual mute), else 0.",
+)
+M_MUTE_ACTIVE = Gauge(
+    "bridge_mute_active",
+    "1 if the bridge is manually muted via /mute command, else 0.",
+)
+M_THROTTLE_ACTIVE_FINGERPRINTS = Gauge(
+    "bridge_throttle_active_fingerprints",
+    "Number of distinct alert fingerprints currently held in the throttle store.",
+)
+M_BUILD_INFO = Info(
+    "bridge_build",
+    "Build information for the bridge process.",
+)
+M_BUILD_INFO.info({
+    "version": os.environ.get("BRIDGE_VERSION", "dev"),
+    "python_version": os.environ.get("PYTHON_VERSION", ""),
+})
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -156,18 +217,27 @@ def tg_request(token: str, method: str, payload: dict, timeout: int = 10) -> dic
         # getUpdates reservation for ~30s after the previous poll dropped,
         # and bombarding it during that window just renews the conflict.
         log.error("Telegram API %s HTTP %d: %s", method, e.code, e.reason)
+        error_type = "http_4xx" if 400 <= e.code < 500 else "http_5xx"
+        M_TELEGRAM_ERRORS.labels(method=method, error_type=error_type).inc()
         return {"ok": False, "error_code": e.code, "description": str(e.reason)}
     except URLError as e:
         log.error("Telegram API %s error: %s", method, e)
+        # `socket.timeout` arrives as a URLError with a `reason` of type
+        # TimeoutError; separate it from generic network failures so the
+        # dashboards can show the two as distinct lines.
+        is_timeout = isinstance(getattr(e, "reason", None), TimeoutError)
+        error_type = "timeout" if is_timeout else "network"
+        M_TELEGRAM_ERRORS.labels(method=method, error_type=error_type).inc()
         return None
 
 
 def send_telegram(token: str, chat_id: str, text: str) -> bool:
-    result = tg_request(token, "sendMessage", {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-    })
+    with M_TELEGRAM_SEND_DURATION.time():
+        result = tg_request(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+        })
     if not result or not result.get("ok"):
         log.error("sendMessage failed: %s", result)
         return False
@@ -389,6 +459,7 @@ def poll_loop(handler: BotCommandHandler, token: str):
         try:
             updates, ok = get_updates(token, offset, timeout=30)
             if not ok:
+                M_GETUPDATES_BACKOFF_SECONDS.inc(ERROR_BACKOFF_SECONDS)
                 time.sleep(ERROR_BACKOFF_SECONDS)
                 continue
             for upd in updates:
@@ -416,6 +487,17 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"ok")
+        elif self.path == "/metrics":
+            # Refresh gauges that reflect instantaneous state before serving.
+            M_QUIET_HOURS_ACTIVE.set(1 if is_quiet_hours(self.cfg, self.mute) else 0)
+            M_MUTE_ACTIVE.set(1 if self.mute.is_muted() else 0)
+            M_THROTTLE_ACTIVE_FINGERPRINTS.set(self.throttle.active_count())
+            output = generate_latest()
+            self.send_response(200)
+            self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+            self.send_header("Content-Length", str(len(output)))
+            self.end_headers()
+            self.wfile.write(output)
         else:
             self.send_response(404)
             self.end_headers()
@@ -456,6 +538,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
             fp       = alert_fingerprint(alert)
             is_crit  = severity == "critical"
 
+            M_ALERTS_RECEIVED.labels(severity=severity, status=status).inc()
+
             # Resolved notifications always go through, regardless of quiet
             # hours or severity. Quiet hours exist to avoid waking people up
             # over new problems — they shouldn't also hide the fact that a
@@ -466,10 +550,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
             elif quiet and not is_crit:
                 log.info("Suppressed (quiet hours): %s", fp)
                 self.stats.inc("suppressed")
+                reason = "mute" if self.mute.is_muted() else "quiet_hours"
+                M_ALERTS_SUPPRESSED.labels(reason=reason, severity=severity).inc()
                 continue
             elif not self.throttle.should_send(fp):
                 log.info("Throttled: %s", fp)
                 self.stats.inc("throttled")
+                M_ALERTS_SUPPRESSED.labels(reason="throttle", severity=severity).inc()
                 continue
 
             qh  = cfg.get("quiet_hours", {})
@@ -485,6 +572,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 ok = send_telegram(target["token"], target["chat_id"], text)
                 if ok:
                     self.stats.inc("sent")
+                    M_TELEGRAM_SENT.labels(severity=severity, status=status).inc()
                 else:
                     self.stats.inc("failed")
                 log.info("Alert %s → %s: %s",
